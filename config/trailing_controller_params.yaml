@@ -1,0 +1,11 @@
+trailing_controller:
+  ros__parameters:
+    kp: 1.0
+    kd: 0.2
+    target_gap: 2.0
+    v_blind: 1.5
+    track_length: 100.0
+    wheelbase: 0.33
+    lookahead_gain: 0.6
+    lookahead_offset: -0.18
+    control_rate: 50.0
