@@ -2,16 +2,12 @@
 
 import rclpy
 from rclpy.node import Node
-from nav_msgs.msg import Odometry, Path
+from nav_msgs.msg import Path
 from visualization_msgs.msg import MarkerArray
-from geometry_msgs.msg import PoseStamped
 import numpy as np
 
 from std_msgs.msg import Float64
 from trailing_controller.frenet_converter import FrenetConverter
-from trailing_controller.longitudinal_controller import LongitudinalController
-from trailing_controller.lateral_controller import LateralController
-
 
 class TrailingControllerNode(Node):
     def __init__(self):
@@ -23,65 +19,45 @@ class TrailingControllerNode(Node):
                 ('kp', 1.0),
                 ('kd', 0.2),
                 ('target_gap', 2.0),
-                ('v_blind', 1.5),
-                ('track_length', 100.0),
-                ('wheelbase', 0.33),
-                ('lookahead_gain', 0.6),
-                ('lookahead_offset', -0.18),
                 ('control_rate', 50.0),
+                ('path_topic', '/pp_path'),
+                ('object_velocity_topic', '/object_velocities'),
+                ('speed_cap_topic', '/speed_cap'),
+                ('max_speed', 8.0),
+                ('min_speed', 0.0),
             ]
         )
         
-        kp = self.get_parameter('kp').value
-        kd = self.get_parameter('kd').value
-        target_gap = self.get_parameter('target_gap').value
-        v_blind = self.get_parameter('v_blind').value
-        track_length = self.get_parameter('track_length').value
-        wheelbase = self.get_parameter('wheelbase').value
-        lookahead_gain = self.get_parameter('lookahead_gain').value
-        lookahead_offset = self.get_parameter('lookahead_offset').value
+        self.kp = self.get_parameter('kp').value
+        self.kd = self.get_parameter('kd').value
+        self.target_gap = self.get_parameter('target_gap').value
         control_rate = self.get_parameter('control_rate').value
+        path_topic = self.get_parameter('path_topic').value
+        object_velocity_topic = self.get_parameter('object_velocity_topic').value
+        speed_cap_topic = self.get_parameter('speed_cap_topic').value
+        self.max_speed = self.get_parameter('max_speed').value
+        self.min_speed = self.get_parameter('min_speed').value
         
         self.frenet_converter = FrenetConverter()
-        self.longitudinal_controller = LongitudinalController(
-            kp=kp, kd=kd, target_gap=target_gap, v_blind=v_blind, track_length=track_length
-        )
-        self.lateral_controller = LateralController(
-            wheelbase=wheelbase, lookahead_gain=lookahead_gain, lookahead_offset=lookahead_offset
-        )
-        
-        self.ego_x = 0.0
-        self.ego_y = 0.0
-        self.ego_psi = 0.0
-        self.ego_vx = 0.0
-        self.ego_vy = 0.0
-        self.ego_s = 0.0
-        self.ego_vs = 0.0
-        
-        self.opp_v_x = 0.0
-        self.opp_v_y = 0.0
+    
         self.opp_s = 0.0
         self.opp_d = 0.0
-        self.opp_vs = 0.0
-        self.opp_vd = 0.0
         self.has_opponent = False
         
         self.raceline_initialized = False
-        
-        self.ego_odom_sub = self.create_subscription(
-            Odometry, '/ego_racecar/odom', self.ego_odom_callback, 10
-        )
+        self.prev_error = 0.0
+        self.prev_time = self.get_clock().now()
         
         self.raceline_sub = self.create_subscription(
-            Path, '/pp_path', self.raceline_callback, 10
+            Path, path_topic, self.raceline_callback, 10
         )
         
         self.opponent_sub = self.create_subscription(
-            MarkerArray, '/object_velocities', self.opponent_callback, 10
+            MarkerArray, object_velocity_topic, self.opponent_callback, 10
         )
         
         self.velocity_pub = self.create_publisher(
-            Float64, '/speed_cap', 10
+            Float64, speed_cap_topic, 10
         )
         
         control_period = 1.0 / control_rate
@@ -115,30 +91,9 @@ class TrailingControllerNode(Node):
             np.array(s_coords), np.array(x_coords), np.array(y_coords)
         )
         
-        self.longitudinal_controller.track_length = s
         self.raceline_initialized = True
         
         self.get_logger().info(f'Raceline updated with {len(msg.poses)} points, track length: {s:.2f}m', throttle_duration_sec=5.0)
-        
-    def ego_odom_callback(self, msg: Odometry):
-        self.ego_x = msg.pose.pose.position.x
-        self.ego_y = msg.pose.pose.position.y
-        
-        orientation_q = msg.pose.pose.orientation
-        siny_cosp = 2 * (orientation_q.w * orientation_q.z + orientation_q.x * orientation_q.y)
-        cosy_cosp = 1 - 2 * (orientation_q.y * orientation_q.y + orientation_q.z * orientation_q.z)
-        self.ego_psi = np.arctan2(siny_cosp, cosy_cosp)
-        
-        self.ego_vx = msg.twist.twist.linear.x
-        self.ego_vy = msg.twist.twist.linear.y
-        
-        if self.raceline_initialized:
-            try:
-                s, d = self.frenet_converter.cartesian_to_frenet(self.ego_x, self.ego_y)
-                self.ego_s = s
-                self.ego_vs = np.sqrt(self.ego_vx**2 + self.ego_vy**2)
-            except Exception as e:
-                self.get_logger().error(f'Failed to convert ego position to Frenet: {e}')
                 
     def opponent_callback(self, msg: MarkerArray):
         self.has_opponent = False
@@ -146,18 +101,12 @@ class TrailingControllerNode(Node):
         for marker in msg.markers:
             if marker.ns == 'velocities' and marker.type == 0:
                 try:
-                    self.opp_v_x = marker.points[0].x
-                    self.opp_v_y = marker.points[0].y
-                    
                     if self.raceline_initialized:
-                        s, d = self.frenet_converter.cartesian_to_frenet(self.opp_v_x, self.opp_v_y)
+                        opp_x = marker.points[0].x
+                        opp_y = marker.points[0].y
+                        s, d = self.frenet_converter.cartesian_to_frenet(opp_x, opp_y)
                         self.opp_s = s
                         self.opp_d = d
-                        
-                        dx = marker.points[1].x - marker.points[0].x
-                        dy = marker.points[1].y - marker.points[0].y
-                        speed = np.sqrt(dx**2 + dy**2) * 2.0
-                        self.opp_vs = speed
                         
                         self.has_opponent = True
                         break
@@ -179,37 +128,31 @@ class TrailingControllerNode(Node):
         
         self.get_logger().info(f'Distance to opponent: {distance:.2f}m', throttle_duration_sec=1.0)
        
-        # TODO: smarter control logic
-        if distance > 6.0: 
-            v_des = distance
-        elif distance > 3.5:
-            v_des = 2.0
-        elif distance > 2.5:
-            v_des = 0.2 
-        else:
-            v_des = 0.0
-        
-        lookahead_distance = self.lateral_controller.lookahead_gain * self.ego_vx + self.lateral_controller.lookahead_offset
-        lookahead_distance = max(0.5, lookahead_distance)
-        
-        s_lookahead = (self.opp_s + lookahead_distance) % self.longitudinal_controller.track_length
-        d_lookahead = 0.0
-        
-        try:
-            target_x, target_y = self.frenet_converter.frenet_to_cartesian(s_lookahead, d_lookahead)
-        except Exception as e:
-            self.get_logger().error(f'Failed to convert lookahead point: {e}')
-            return
-            
-        steering_angle = self.lateral_controller.compute_steering(
-            self.ego_x, self.ego_y, self.ego_psi, self.ego_vx, target_x, target_y
-        )
-        
+        current_time = self.get_clock().now()
+        error, v_des = self.control_distance(distance, current_time)
+        self.prev_time = current_time
+        self.prev_error = error
+       
         velocity_msg = Float64()
         velocity_msg.data = float(v_des)
         self.velocity_pub.publish(velocity_msg)
 
-
+    def control_distance(self, distance, current_time):
+        dt = (current_time - self.prev_time).nanoseconds / 1e9
+        
+        error = distance - self.target_gap
+        
+        if dt > 0:
+            error_derivative = (error - self.prev_error) / dt
+        else:
+            error_derivative = 0.0
+        
+        v_des = self.kp * error + self.kd * error_derivative
+        
+        v_des = max(self.min_speed, min(self.max_speed, v_des))
+        
+        return error, v_des
+    
 def main(args=None):
     rclpy.init(args=args)
     node = TrailingControllerNode()
