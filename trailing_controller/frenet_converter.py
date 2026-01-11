@@ -1,77 +1,126 @@
 #!/usr/bin/env python3
 
 import numpy as np
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import interp1d
+from scipy.spatial.distance import cdist
+from typing import Tuple, Optional
 
 
 class FrenetConverter:
-    def __init__(self):
-        self.raceline_s = None
-        self.raceline_x = None
-        self.raceline_y = None
-        self.raceline_psi = None
-        self.x_spline = None
-        self.y_spline = None
-        self.psi_spline = None
+    def __init__(self, raceline_s: Optional[np.ndarray] = None,
+                 raceline_x: Optional[np.ndarray] = None,
+                 raceline_y: Optional[np.ndarray] = None):
+        self.raceline_s = raceline_s
+        self.raceline_x = raceline_x
+        self.raceline_y = raceline_y
         
-    def update_raceline(self, s_coords, x_coords, y_coords):
-        self.raceline_s = s_coords
-        self.raceline_x = x_coords
-        self.raceline_y = y_coords
-        
-        psi = np.zeros(len(s_coords))
-        for i in range(len(s_coords) - 1):
-            dx = x_coords[i+1] - x_coords[i]
-            dy = y_coords[i+1] - y_coords[i]
-            psi[i] = np.arctan2(dy, dx)
-        psi[-1] = psi[0]
-        self.raceline_psi = psi
-        
-        y_coords_updated = y_coords + [y_coords[0]]
-        x_coords_updated = x_coords + [x_coords[0]]
-        self.x_spline = CubicSpline(s_coords, x_coords_updated, bc_type='periodic')
-        self.y_spline = CubicSpline(s_coords, y_coords_updated, bc_type='periodic')
-        self.psi_spline = CubicSpline(s_coords, psi, bc_type='periodic')
-        
-    def cartesian_to_frenet(self, x, y):
-        if self.raceline_s is None:
-            raise ValueError("Raceline not initialized")
+        if raceline_s is not None and raceline_x is not None:
+            self.interp_x = interp1d(raceline_s, raceline_x, kind='cubic', 
+                                     fill_value='extrapolate')
+            self.interp_y = interp1d(raceline_s, raceline_y, kind='cubic',
+                                     fill_value='extrapolate')
+        else:
+            self.interp_x = None
+            self.interp_y = None
             
-        distances = np.sqrt((self.raceline_x - x)**2 + (self.raceline_y - y)**2)
-        k_bar = np.argmin(distances)
+    def update_raceline(self, raceline_s: np.ndarray, raceline_x: np.ndarray,
+                        raceline_y: np.ndarray):
+        self.raceline_s = raceline_s
+        self.raceline_x = raceline_x
+        self.raceline_y = raceline_y
         
-        dx = x - self.raceline_x[k_bar]
-        dy = y - self.raceline_y[k_bar]
-        psi_k = self.raceline_psi[k_bar]
+        self.interp_x = interp1d(raceline_s, raceline_x, kind='cubic',
+                                fill_value='extrapolate')
+        self.interp_y = interp1d(raceline_s, raceline_y, kind='cubic',
+                                fill_value='extrapolate')
         
-        s = self.raceline_s[k_bar] + dx * np.cos(psi_k) + dy * np.sin(psi_k)
-        d = -dx * np.sin(psi_k) + dy * np.cos(psi_k)
+    def cartesian_to_frenet(self, x: float, y: float) -> Tuple[float, float]:
+        if self.raceline_s is None:
+            return 0.0, np.sqrt(x**2 + y**2)
+            
+        raceline_points = np.column_stack((self.raceline_x, self.raceline_y))
+        point = np.array([[x, y]])
+        
+        distances = cdist(point, raceline_points)[0]
+        closest_idx = np.argmin(distances)
+        
+        s = self.raceline_s[closest_idx]
+        
+        if closest_idx < len(self.raceline_s) - 1:
+            p1 = raceline_points[closest_idx]
+            p2 = raceline_points[closest_idx + 1]
+        else:
+            p1 = raceline_points[closest_idx - 1]
+            p2 = raceline_points[closest_idx]
+            
+        tangent = p2 - p1
+        tangent = tangent / np.linalg.norm(tangent)
+        
+        normal = np.array([-tangent[1], tangent[0]])
+        
+        vector_to_point = point[0] - raceline_points[closest_idx]
+        d = np.dot(vector_to_point, normal)
         
         return s, d
         
-    def frenet_to_cartesian(self, s, d):
-        if self.raceline_s is None:
-            raise ValueError("Raceline not initialized")
+    def frenet_to_cartesian(self, s: float, d: float) -> Tuple[float, float]:
+        if self.interp_x is None:
+            return 0.0, 0.0
             
-        s_wrapped = s % self.raceline_s[-1]
+        x_center = float(self.interp_x(s))
+        y_center = float(self.interp_y(s))
         
-        x_ref = self.x_spline(s_wrapped)
-        y_ref = self.y_spline(s_wrapped)
-        psi_ref = self.psi_spline(s_wrapped)
+        ds = 0.01
+        x_ahead = float(self.interp_x(s + ds))
+        y_ahead = float(self.interp_y(s + ds))
         
-        x = x_ref - d * np.sin(psi_ref)
-        y = y_ref + d * np.cos(psi_ref)
+        tangent = np.array([x_ahead - x_center, y_ahead - y_center])
+        tangent = tangent / np.linalg.norm(tangent)
+        
+        normal = np.array([-tangent[1], tangent[0]])
+        
+        x = x_center + d * normal[0]
+        y = y_center + d * normal[1]
         
         return x, y
+    
+    def frenet_velocity_to_cartesian(self, s: float, d: float, vs: float, vd: float) -> Tuple[float, float]:
+        if self.interp_x is None:
+            return 0.0, 0.0
         
-    def frenet_velocity_to_cartesian(self, s, d, vs, vd):
-        if self.raceline_s is None:
-            raise ValueError("Raceline not initialized")
-            
-        s_wrapped = s % self.raceline_s[-1]
-        psi_ref = self.psi_spline(s_wrapped)
+        ds = 0.01
+        x_center = float(self.interp_x(s))
+        y_center = float(self.interp_y(s))
+        x_ahead = float(self.interp_x(s + ds))
+        y_ahead = float(self.interp_y(s + ds))
         
-        vx = vs * np.cos(psi_ref) - vd * np.sin(psi_ref)
-        vy = vs * np.sin(psi_ref) + vd * np.cos(psi_ref)
+        tangent = np.array([x_ahead - x_center, y_ahead - y_center])
+        tangent = tangent / np.linalg.norm(tangent)
         
-        return vx, vy
+        normal = np.array([-tangent[1], tangent[0]])
+        
+        vx = vs * tangent[0] + vd * normal[0]
+        vy = vs * tangent[1] + vd * normal[1]
+        
+        return float(vx), float(vy)
+    
+    def cartesian_velocity_to_frenet(self, s: float, d: float, vx: float, vy: float) -> Tuple[float, float]:
+        if self.interp_x is None:
+            return 0.0, 0.0
+        
+        ds = 0.01
+        x_center = float(self.interp_x(s))
+        y_center = float(self.interp_y(s))
+        x_ahead = float(self.interp_x(s + ds))
+        y_ahead = float(self.interp_y(s + ds))
+        
+        tangent = np.array([x_ahead - x_center, y_ahead - y_center])
+        tangent = tangent / np.linalg.norm(tangent)
+        
+        normal = np.array([-tangent[1], tangent[0]])
+        
+        v_cartesian = np.array([vx, vy])
+        vs = np.dot(v_cartesian, tangent)
+        vd = np.dot(v_cartesian, normal)
+        
+        return float(vs), float(vd)

@@ -3,11 +3,11 @@
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry, Path
-from ackermann_msgs.msg import AckermannDriveStamped
 from visualization_msgs.msg import MarkerArray
 from geometry_msgs.msg import PoseStamped
 import numpy as np
 
+from std_msgs.msg import Float64
 from trailing_controller.frenet_converter import FrenetConverter
 from trailing_controller.longitudinal_controller import LongitudinalController
 from trailing_controller.lateral_controller import LateralController
@@ -58,9 +58,10 @@ class TrailingControllerNode(Node):
         self.ego_s = 0.0
         self.ego_vs = 0.0
         
-        self.opp_x = 0.0
-        self.opp_y = 0.0
+        self.opp_v_x = 0.0
+        self.opp_v_y = 0.0
         self.opp_s = 0.0
+        self.opp_d = 0.0
         self.opp_vs = 0.0
         self.opp_vd = 0.0
         self.has_opponent = False
@@ -79,8 +80,8 @@ class TrailingControllerNode(Node):
             MarkerArray, '/object_velocities', self.opponent_callback, 10
         )
         
-        self.drive_pub = self.create_publisher(
-            AckermannDriveStamped, '/drive', 10
+        self.velocity_pub = self.create_publisher(
+            Float64, '/speed_cap', 10
         )
         
         control_period = 1.0 / control_rate
@@ -145,12 +146,13 @@ class TrailingControllerNode(Node):
         for marker in msg.markers:
             if marker.ns == 'velocities' and marker.type == 0:
                 try:
-                    self.opp_x = marker.points[0].x
-                    self.opp_y = marker.points[0].y
+                    self.opp_v_x = marker.points[0].x
+                    self.opp_v_y = marker.points[0].y
                     
                     if self.raceline_initialized:
-                        s, d = self.frenet_converter.cartesian_to_frenet(self.opp_x, self.opp_y)
+                        s, d = self.frenet_converter.cartesian_to_frenet(self.opp_v_x, self.opp_v_y)
                         self.opp_s = s
+                        self.opp_d = d
                         
                         dx = marker.points[1].x - marker.points[0].x
                         dy = marker.points[1].y - marker.points[0].y
@@ -168,18 +170,24 @@ class TrailingControllerNode(Node):
             return
             
         if not self.has_opponent:
-            self.get_logger().warn('No opponent detected, stopping', throttle_duration_sec=2.0)
-            drive_msg = AckermannDriveStamped()
-            drive_msg.header.stamp = self.get_clock().now().to_msg()
-            drive_msg.header.frame_id = 'base_link'
-            drive_msg.drive.speed = 0.0
-            drive_msg.drive.steering_angle = 0.0
-            self.drive_pub.publish(drive_msg)
+            self.get_logger().warn('No opponent detected, stopping', throttle_duration_sec=2.0)       
+            self.velocity_pub.publish(Float64(data=-1.0))
             return
             
-        v_des = self.longitudinal_controller.compute_velocity(
-            self.ego_s, self.ego_vs, self.opp_s, self.opp_vs
-        )
+        opp_x, opp_y = self.frenet_converter.frenet_to_cartesian(self.opp_s, self.opp_d)
+        distance = np.sqrt(opp_x**2 +  opp_y**2)
+        
+        self.get_logger().info(f'Distance to opponent: {distance:.2f}m', throttle_duration_sec=1.0)
+       
+        # TODO: smarter control logic
+        if distance > 6.0: 
+            v_des = distance
+        elif distance > 3.5:
+            v_des = 2.0
+        elif distance > 2.5:
+            v_des = 0.2 
+        else:
+            v_des = 0.0
         
         lookahead_distance = self.lateral_controller.lookahead_gain * self.ego_vx + self.lateral_controller.lookahead_offset
         lookahead_distance = max(0.5, lookahead_distance)
@@ -197,13 +205,9 @@ class TrailingControllerNode(Node):
             self.ego_x, self.ego_y, self.ego_psi, self.ego_vx, target_x, target_y
         )
         
-        drive_msg = AckermannDriveStamped()
-        drive_msg.header.stamp = self.get_clock().now().to_msg()
-        drive_msg.header.frame_id = 'base_link'
-        drive_msg.drive.speed = float(v_des)
-        drive_msg.drive.steering_angle = float(steering_angle)
-        
-        self.drive_pub.publish(drive_msg)
+        velocity_msg = Float64()
+        velocity_msg.data = float(v_des)
+        self.velocity_pub.publish(velocity_msg)
 
 
 def main(args=None):
