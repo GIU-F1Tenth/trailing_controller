@@ -3,7 +3,7 @@
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Path
-from visualization_msgs.msg import MarkerArray
+from visualization_msgs.msg import MarkerArray, Marker
 import numpy as np
 
 from std_msgs.msg import Float64
@@ -99,7 +99,7 @@ class TrailingControllerNode(Node):
         self.has_opponent = False
         
         for marker in msg.markers:
-            if marker.ns == 'velocities' and marker.type == 0:
+            if marker.type == Marker.POINTS:
                 try:
                     if self.raceline_initialized:
                         opp_x = marker.points[0].x
